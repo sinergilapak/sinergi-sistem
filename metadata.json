@@ -1,0 +1,6 @@
+{
+  "name": "Sinergi Lapak",
+  "description": "Sistem Manajemen Multi-Channel Retail, HPP, Biaya Marketplace, Team Allocation & Pelaporan Laba Rugi",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
