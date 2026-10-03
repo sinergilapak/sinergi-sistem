@@ -235,13 +235,13 @@ export const DataIntegritySuite: React.FC<DataIntegritySuiteProps> = ({ dbState 
       specSection: 'Section 7, 21-27',
       description: 'Biaya admin dan fee program otomatis dipotong sesuai konfigurasi 11_COST_RULES.',
       run: (state) => {
-        const fees = getApplicableMarketplaceFees(100000, 'MKT-SHOPEE', 'CAT-ELK-AUD', 'BRD-001', 'SPU-001', 'E003BK', 'U001', state.costRules);
-        const totalFee = fees.reduce((sum, f) => sum + f.feeAmount, 0);
-        const passed = fees.length >= 2 && totalFee > 0;
+        const feeResult = getApplicableMarketplaceFees(100000, 'MKT-SHOPEE', 'CAT-ELK-AUD', 'BRD-001', 'SPU-001', 'E003BK', 'U001', state.costRules);
+        const totalFee = feeResult.totalFeeAmount;
+        const passed = feeResult.fees.length >= 2 && totalFee > 0;
         return {
           passed,
           details: passed
-            ? `Terverifikasi ${fees.length} rule marketplace aktif. Simulasi omzet Rp 100.000 menghasilkan potongan fee ${formatIDR(totalFee)}.`
+            ? `Terverifikasi ${feeResult.fees.length} rule marketplace aktif. Simulasi omzet Rp 100.000 menghasilkan potongan fee ${formatIDR(totalFee)}.`
             : `Gagal: Potongan marketplace tidak terhitung.`,
         };
       },

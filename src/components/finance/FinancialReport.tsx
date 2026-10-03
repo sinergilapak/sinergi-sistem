@@ -215,7 +215,7 @@ export const FinancialReport: React.FC<FinancialReportProps> = ({
       const grossMarginPct = sellingPrice > 0 ? grossProfitPerUnit / sellingPrice : 0;
 
       // Retrieve marketplace fees from cost rules in master data hub
-      const fees = getApplicableMarketplaceFees(
+      const feeResult = getApplicableMarketplaceFees(
         sellingPrice,
         channel.marketplace_id,
         sku.category_id,
@@ -227,7 +227,7 @@ export const FinancialReport: React.FC<FinancialReportProps> = ({
         activePrograms
       );
 
-      const totalMarketplaceFeePerUnit = fees.reduce((sum, f) => sum + f.feeAmount, 0);
+      const totalMarketplaceFeePerUnit = feeResult.totalFeeAmount;
       const platformFeePct = sellingPrice > 0 ? totalMarketplaceFeePerUnit / sellingPrice : 0;
 
       const profitBeforeAds = grossProfitPerUnit - totalMarketplaceFeePerUnit;
@@ -275,7 +275,7 @@ export const FinancialReport: React.FC<FinancialReportProps> = ({
         hpp,
         grossProfitPerUnit,
         grossMarginPct,
-        fees,
+        fees: feeResult.fees,
         totalMarketplaceFeePerUnit,
         platformFeePct,
         profitBeforeAds,
@@ -381,7 +381,7 @@ export const FinancialReport: React.FC<FinancialReportProps> = ({
         includeOptionalFees ? ['ALL_MANDATORY', 'FREE_SHIPPING', 'CASHBACK', 'ALL'] : ['ALL_MANDATORY']
       );
 
-      const feePerUnit = fees.reduce((sum, f) => sum + f.feeAmount, 0);
+      const feePerUnit = fees.totalFeeAmount;
       const feePct = projectedSellingPrice > 0 ? feePerUnit / projectedSellingPrice : 0;
 
       // Unit Profit before and after Ads

@@ -107,7 +107,7 @@ export function scanProfitMarginAlerts(
       ['ALL_MANDATORY', 'FREE_SHIPPING', 'CASHBACK', 'ALL']
     );
 
-    const platformFee = fees.reduce((sum, f) => sum + f.feeAmount, 0);
+    const platformFee = fees.totalFeeAmount;
     const profitBeforeAds = sellingPrice - hpp - platformFee;
     const marginBeforeAdsPct = sellingPrice > 0 ? profitBeforeAds / sellingPrice : 0;
 

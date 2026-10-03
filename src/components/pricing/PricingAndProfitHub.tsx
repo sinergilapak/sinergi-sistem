@@ -77,7 +77,7 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
     const recommendedPrice = divisor > 0 ? Math.round(effectiveHpp / divisor / 500) * 500 : effectiveHpp * 1.5;
 
     // Platform Fee Breakdown using real rules
-    const fees = getApplicableMarketplaceFees(
+    const feeResult = getApplicableMarketplaceFees(
       recommendedPrice,
       calcMarketplace,
       activeSkuObj?.category_id || '',
@@ -88,7 +88,7 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
       dbState.costRules
     );
 
-    const totalFeeAmount = fees.reduce((acc, f) => acc + f.feeAmount, 0);
+    const totalFeeAmount = feeResult.totalFeeAmount;
     const grossProfit = recommendedPrice - effectiveHpp;
     const profitBeforeAds = grossProfit - totalFeeAmount;
     const adsBudget = Math.round(recommendedPrice * estAdsRate);
@@ -98,7 +98,7 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
 
     return {
       recommendedPrice,
-      fees,
+      fees: feeResult.fees,
       totalFeeAmount,
       grossProfit,
       profitBeforeAds,

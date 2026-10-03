@@ -12,7 +12,14 @@ import {
   AlertTriangle,
   X,
   ChevronRight,
+  ChevronDown,
+  ChevronUp,
   TrendingUp,
+  SlidersHorizontal,
+  Sliders,
+  DollarSign,
+  Percent,
+  Check,
 } from 'lucide-react';
 import {
   DatabaseState,
@@ -22,6 +29,11 @@ import {
 } from '../../types/database';
 import { storageService } from '../../services/storageService';
 import { formatIDR, formatPercent, validateSkuInput } from '../../utils/validation';
+import {
+  calculateProductUnitEconomics,
+  getApplicableMarketplaceFees,
+  ProductUnitEconomics,
+} from '../../utils/financialEngine';
 
 export type ProductsSubTab = 'spu' | 'sku' | 'channel_prices';
 
@@ -40,6 +52,35 @@ export const ProductHub: React.FC<ProductHubProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [unitFilter, setUnitFilter] = useState<string>('ALL');
   const [mktFilter, setMktFilter] = useState<string>('ALL');
+
+  // Expanded row tracking for Channel Prices
+  const [expandedChannelId, setExpandedChannelId] = useState<string | null>(null);
+
+  // Column visibility settings (Atur Kolom)
+  const [showColumnModal, setShowColumnModal] = useState(false);
+  const [visibleColumns, setVisibleColumns] = useState({
+    hpp: true,
+    selling_price: true,
+    promo_price: true,
+    admin_fee: false,
+    service_fee: false,
+    payment_fee: false,
+    shipping_fee: false,
+    voucher_fee: false,
+    affiliate_fee: false,
+    campaign_fee: false,
+    tax_fee: false,
+    total_fee: true,
+    net_profit: true,
+    net_margin: true,
+    roas: false,
+    cir: false,
+    ads_status: true,
+  });
+
+  const toggleColumn = (colKey: keyof typeof visibleColumns) => {
+    setVisibleColumns((prev) => ({ ...prev, [colKey]: !prev[colKey] }));
+  };
 
   // Sync prop changes
   React.useEffect(() => {
@@ -311,20 +352,30 @@ export const ProductHub: React.FC<ProductHubProps> = ({
     });
   }, [dbState.spus, searchQuery]);
 
-  // Filtered Channels
-  const filteredChannels = useMemo(() => {
+  // Filtered Channels with Granular Unit Economics
+  const filteredChannelsWithEconomics = useMemo(() => {
     const q = searchQuery.toLowerCase();
-    return dbState.productChannels.filter((c) => {
-      const matchUnit = unitFilter === 'ALL' || c.unit_id === unitFilter;
-      const matchMkt = mktFilter === 'ALL' || c.marketplace_id === mktFilter;
-      const skuObj = dbState.skus.find((s) => s.sku === c.sku);
-      const matchQuery =
-        !q ||
-        c.sku.toLowerCase().includes(q) ||
-        (skuObj && skuObj.sku_name.toLowerCase().includes(q));
-      return matchUnit && matchMkt && matchQuery;
-    });
-  }, [dbState.productChannels, unitFilter, mktFilter, searchQuery, dbState.skus]);
+    return dbState.productChannels
+      .filter((c) => {
+        const matchUnit = unitFilter === 'ALL' || c.unit_id === unitFilter;
+        const matchMkt = mktFilter === 'ALL' || c.marketplace_id === mktFilter;
+        const skuObj = dbState.skus.find((s) => s.sku === c.sku);
+        const matchQuery =
+          !q ||
+          c.sku.toLowerCase().includes(q) ||
+          (skuObj && skuObj.sku_name.toLowerCase().includes(q));
+        return matchUnit && matchMkt && matchQuery;
+      })
+      .map((c) => {
+        const skuObj = dbState.skus.find((s) => s.sku === c.sku);
+        const econ = calculateProductUnitEconomics(c, skuObj, dbState.costRules);
+        return {
+          channel: c,
+          sku: skuObj,
+          econ,
+        };
+      });
+  }, [dbState.productChannels, unitFilter, mktFilter, searchQuery, dbState.skus, dbState.costRules]);
 
   return (
     <div className="space-y-6 pb-6">
@@ -336,7 +387,7 @@ export const ProductHub: React.FC<ProductHubProps> = ({
               Produk & Katalog Retail
             </h1>
             <p className="text-xs sm:text-sm text-slate-500 mt-1">
-              Daftar produk, varian SKU, biaya modal HPP, dan harga jual marketplace
+              Daftar produk, varian SKU, biaya modal HPP, dan analisis profitabilitas harga marketplace
             </p>
           </div>
 
@@ -381,7 +432,7 @@ export const ProductHub: React.FC<ProductHubProps> = ({
             <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
             <input
               type="text"
-              placeholder="Cari kode atau nama..."
+              placeholder="Cari kode SKU atau nama produk..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-1.5 rounded-lg border border-slate-200 text-xs focus:outline-hidden focus:border-blue-500"
@@ -409,7 +460,19 @@ export const ProductHub: React.FC<ProductHubProps> = ({
                 <option value="MKT-TOKOPEDIA">Tokopedia</option>
                 <option value="MKT-TIKTOK">TikTok Shop</option>
                 <option value="MKT-LAZADA">Lazada</option>
+                <option value="MKT-BLIBLI">Blibli</option>
+                <option value="MKT-CASH">Cash / Toko</option>
               </select>
+
+              {/* Atur Kolom Button */}
+              <button
+                onClick={() => setShowColumnModal(true)}
+                className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-medium flex items-center space-x-1"
+                title="Atur kolom tabel"
+              >
+                <Sliders className="w-3.5 h-3.5 text-slate-500" />
+                <span>Atur Kolom</span>
+              </button>
             </div>
           )}
 
@@ -558,91 +621,426 @@ export const ProductHub: React.FC<ProductHubProps> = ({
         </div>
       )}
 
-      {/* Content for TAB 3: Harga Marketplace */}
+      {/* Content for TAB 3: Harga Marketplace (Section 1 & 2: Detail Net Margin & Expandable Fees) */}
       {currentSubTab === 'channel_prices' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-50 text-slate-600 font-semibold border-b border-slate-200">
                 <tr>
-                  <th className="py-3 px-4">SKU Produk</th>
+                  <th className="py-3 px-4 w-8"></th>
+                  <th className="py-3 px-4">SKU & Produk</th>
                   <th className="py-3 px-4">Marketplace</th>
-                  <th className="py-3 px-4">Unit Bisnis</th>
-                  <th className="py-3 px-4 text-right">Harga Jual</th>
-                  <th className="py-3 px-4 text-right">Harga Promo</th>
-                  <th className="py-3 px-4 text-right">Margin Kotor</th>
-                  <th className="py-3 px-4 text-center">Status Iklan</th>
+                  <th className="py-3 px-4">Unit</th>
+                  {visibleColumns.hpp && <th className="py-3 px-4 text-right">HPP</th>}
+                  {visibleColumns.selling_price && <th className="py-3 px-4 text-right">Harga Jual</th>}
+                  {visibleColumns.promo_price && <th className="py-3 px-4 text-right">Promo</th>}
+                  {visibleColumns.admin_fee && <th className="py-3 px-4 text-right">Biaya Admin</th>}
+                  {visibleColumns.service_fee && <th className="py-3 px-4 text-right">Biaya Layanan</th>}
+                  {visibleColumns.payment_fee && <th className="py-3 px-4 text-right">Pembayaran</th>}
+                  {visibleColumns.shipping_fee && <th className="py-3 px-4 text-right">Gratis Ongkir</th>}
+                  {visibleColumns.voucher_fee && <th className="py-3 px-4 text-right">Voucher</th>}
+                  {visibleColumns.affiliate_fee && <th className="py-3 px-4 text-right">Affiliate</th>}
+                  {visibleColumns.campaign_fee && <th className="py-3 px-4 text-right">Campaign</th>}
+                  {visibleColumns.tax_fee && <th className="py-3 px-4 text-right">Pajak</th>}
+                  {visibleColumns.total_fee && <th className="py-3 px-4 text-right">Total Biaya</th>}
+                  {visibleColumns.net_profit && (
+                    <th className="py-3 px-4 text-right font-bold text-slate-900">Laba Bersih</th>
+                  )}
+                  {visibleColumns.net_margin && <th className="py-3 px-4 text-right">Net Margin</th>}
+                  {visibleColumns.roas && <th className="py-3 px-4 text-center">ROAS</th>}
+                  {visibleColumns.cir && <th className="py-3 px-4 text-center">CIR</th>}
+                  {visibleColumns.ads_status && <th className="py-3 px-4 text-center">Status</th>}
                   <th className="py-3 px-4 text-right">Aksi</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filteredChannels.map((ch) => {
-                  const sku = dbState.skus.find((s) => s.sku === ch.sku);
-                  const hpp = sku?.hpp || 0;
-                  const grossProfit = ch.selling_price - hpp;
-                  const grossMargin = ch.selling_price > 0 ? grossProfit / ch.selling_price : 0;
-                  const marketplace = dbState.marketplaces.find((m) => m.marketplace_id === ch.marketplace_id)?.marketplace_name || ch.marketplace_id;
-                  const unitName = ch.unit_id === 'U001' ? 'Kanbai' : 'Nutribite';
+                {filteredChannelsWithEconomics.map(({ channel: ch, sku, econ }) => {
+                  const isExpanded = expandedChannelId === ch.config_id;
+                  const marketplace =
+                    dbState.marketplaces.find((m) => m.marketplace_id === ch.marketplace_id)
+                      ?.marketplace_name || ch.marketplace_id;
 
                   return (
-                    <tr key={ch.config_id} className="hover:bg-slate-50/60 transition-colors">
-                      <td className="py-3 px-4">
-                        <div className="font-mono font-bold text-slate-900">{ch.sku}</div>
-                        <div className="text-[11px] text-slate-500">{sku?.sku_name}</div>
-                      </td>
-                      <td className="py-3 px-4 font-medium text-slate-800">{marketplace}</td>
-                      <td className="py-3 px-4">
-                        <span
-                          className={`px-2 py-0.5 rounded text-[11px] font-medium ${
-                            ch.unit_id === 'U001'
-                              ? 'bg-blue-50 text-blue-700'
-                              : 'bg-emerald-50 text-emerald-700'
-                          }`}
+                    <React.Fragment key={ch.config_id}>
+                      <tr
+                        onClick={() => setExpandedChannelId(isExpanded ? null : ch.config_id)}
+                        className={`cursor-pointer transition-colors ${
+                          isExpanded ? 'bg-blue-50/40' : 'hover:bg-slate-50/60'
+                        }`}
+                      >
+                        <td className="py-3 px-2 text-center text-slate-400">
+                          {isExpanded ? (
+                            <ChevronUp className="w-4 h-4 text-blue-600 inline" />
+                          ) : (
+                            <ChevronDown className="w-4 h-4 inline" />
+                          )}
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-mono font-bold text-slate-900">{ch.sku}</div>
+                          <div className="text-[11px] text-slate-500 truncate max-w-[180px]">
+                            {sku?.sku_name}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 font-medium text-slate-800">{marketplace}</td>
+                        <td className="py-3 px-4">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[11px] font-medium ${
+                              ch.unit_id === 'U001'
+                                ? 'bg-blue-50 text-blue-700'
+                                : 'bg-emerald-50 text-emerald-700'
+                            }`}
+                          >
+                            {econ.unitName}
+                          </span>
+                        </td>
+                        {visibleColumns.hpp && (
+                          <td className="py-3 px-4 text-right font-mono text-slate-600">
+                            {formatIDR(econ.hpp)}
+                          </td>
+                        )}
+                        {visibleColumns.selling_price && (
+                          <td className="py-3 px-4 text-right font-bold text-slate-900">
+                            {formatIDR(econ.sellingPrice)}
+                          </td>
+                        )}
+                        {visibleColumns.promo_price && (
+                          <td className="py-3 px-4 text-right text-slate-600">
+                            {formatIDR(econ.promoPrice)}
+                          </td>
+                        )}
+                        {visibleColumns.admin_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.adminFee)}
+                          </td>
+                        )}
+                        {visibleColumns.service_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.serviceFee)}
+                          </td>
+                        )}
+                        {visibleColumns.payment_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.paymentFee)}
+                          </td>
+                        )}
+                        {visibleColumns.shipping_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.freeShippingFee)}
+                          </td>
+                        )}
+                        {visibleColumns.voucher_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.voucherFee)}
+                          </td>
+                        )}
+                        {visibleColumns.affiliate_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.affiliateFee)}
+                          </td>
+                        )}
+                        {visibleColumns.campaign_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.campaignFee)}
+                          </td>
+                        )}
+                        {visibleColumns.tax_fee && (
+                          <td className="py-3 px-4 text-right text-slate-700">
+                            {formatIDR(econ.feeResult.breakdown.taxFee)}
+                          </td>
+                        )}
+                        {visibleColumns.total_fee && (
+                          <td className="py-3 px-4 text-right font-medium text-slate-900">
+                            {econ.hasConfiguredFees ? (
+                              formatIDR(econ.totalMarketplaceFee)
+                            ) : (
+                              <span className="text-[10px] text-amber-600 font-semibold bg-amber-50 px-1.5 py-0.5 rounded">
+                                Belum diatur
+                              </span>
+                            )}
+                          </td>
+                        )}
+                        {visibleColumns.net_profit && (
+                          <td
+                            className={`py-3 px-4 text-right font-bold ${
+                              econ.profitAfterMarketplace >= 0 ? 'text-emerald-600' : 'text-red-600'
+                            }`}
+                          >
+                            {formatIDR(econ.profitAfterMarketplace)}
+                          </td>
+                        )}
+                        {visibleColumns.net_margin && (
+                          <td
+                            className={`py-3 px-4 text-right font-semibold ${
+                              econ.netMarginPct >= 0.1
+                                ? 'text-emerald-600'
+                                : econ.netMarginPct > 0
+                                ? 'text-amber-600'
+                                : 'text-red-600'
+                            }`}
+                          >
+                            {formatPercent(econ.netMarginPct)}
+                          </td>
+                        )}
+                        {visibleColumns.roas && (
+                          <td className="py-3 px-4 text-center text-slate-700 font-medium">
+                            {econ.beRoas ? `${econ.beRoas}x` : 'N/A'}
+                          </td>
+                        )}
+                        {visibleColumns.cir && (
+                          <td className="py-3 px-4 text-center text-slate-700">
+                            {formatPercent(econ.cir)}
+                          </td>
+                        )}
+                        {visibleColumns.ads_status && (
+                          <td className="py-3 px-4 text-center">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                                econ.healthStatus === 'ADS_ELIGIBLE'
+                                  ? 'bg-emerald-50 text-emerald-700'
+                                  : econ.healthStatus === 'ORGANIC_ONLY'
+                                  ? 'bg-amber-50 text-amber-800'
+                                  : 'bg-red-50 text-red-700'
+                              }`}
+                            >
+                              {econ.healthStatus === 'ADS_ELIGIBLE'
+                                ? 'Iklan Aman'
+                                : econ.healthStatus === 'ORGANIC_ONLY'
+                                ? 'Organik Saja'
+                                : 'Rugi'}
+                            </span>
+                          </td>
+                        )}
+                        <td
+                          className="py-3 px-4 text-right space-x-2"
+                          onClick={(e) => e.stopPropagation()}
                         >
-                          {unitName}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-right font-bold text-slate-900">
-                        {formatIDR(ch.selling_price)}
-                      </td>
-                      <td className="py-3 px-4 text-right text-slate-600">
-                        {formatIDR(ch.promo_price || ch.selling_price)}
-                      </td>
-                      <td className="py-3 px-4 text-right font-semibold text-emerald-600">
-                        {formatPercent(grossMargin)}
-                      </td>
-                      <td className="py-3 px-4 text-center">
-                        <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                            ch.ads_status
-                              ? 'bg-emerald-50 text-emerald-700'
-                              : 'bg-slate-100 text-slate-500'
-                          }`}
-                        >
-                          {ch.ads_status ? 'Aktif' : 'Organik'}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-right space-x-2">
-                        <button
-                          onClick={() => openEditChannel(ch)}
-                          className="p-1 text-slate-500 hover:text-blue-600 transition-colors"
-                          title="Ubah Harga"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => handleDeleteChannel(ch)}
-                          className="p-1 text-slate-400 hover:text-red-600 transition-colors"
-                          title="Hapus"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </td>
-                    </tr>
+                          <button
+                            onClick={() => openEditChannel(ch)}
+                            className="p-1 text-slate-500 hover:text-blue-600 transition-colors"
+                            title="Ubah Harga"
+                          >
+                            <Edit2 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteChannel(ch)}
+                            className="p-1 text-slate-400 hover:text-red-600 transition-colors"
+                            title="Hapus"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+
+                      {/* Expandable Detail Drawer (Section 2) */}
+                      {isExpanded && (
+                        <tr className="bg-slate-50/80 border-b border-blue-100">
+                          <td colSpan={22} className="p-4 sm:p-5">
+                            <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-2xs space-y-4">
+                              <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
+                                <div>
+                                  <div className="text-xs font-bold text-slate-900 flex items-center space-x-2">
+                                    <span>
+                                      Rincian Biaya Marketplace: {ch.sku} - {sku?.sku_name}
+                                    </span>
+                                    <span className="text-[11px] font-medium px-2 py-0.5 bg-blue-50 text-blue-700 rounded">
+                                      {marketplace} ({econ.unitName})
+                                    </span>
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 mt-0.5">
+                                    Harga Jual: {formatIDR(econ.sellingPrice)} · HPP: {formatIDR(econ.hpp)} ·
+                                    Laba Kotor: {formatIDR(econ.grossProfit)} (
+                                    {formatPercent(econ.grossMarginPct)})
+                                  </div>
+                                </div>
+
+                                <div className="text-right">
+                                  <span className="text-[10px] text-slate-400 block">Laba Bersih Akhir</span>
+                                  <span
+                                    className={`text-sm font-extrabold ${
+                                      econ.profitAfterMarketplace >= 0
+                                        ? 'text-emerald-700'
+                                        : 'text-red-600'
+                                    }`}
+                                  >
+                                    {formatIDR(econ.profitAfterMarketplace)} (
+                                    {formatPercent(econ.netMarginPct)})
+                                  </span>
+                                </div>
+                              </div>
+
+                              {/* Itemized Marketplace Fee Breakdown */}
+                              {econ.feeResult.fees.length > 0 ? (
+                                <div className="space-y-1.5">
+                                  <div className="text-[11px] font-semibold text-slate-700 mb-1">
+                                    Potongan Biaya Terhitung:
+                                  </div>
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                                    {econ.feeResult.fees.map((fee) => (
+                                      <div
+                                        key={fee.ruleId}
+                                        className="p-2.5 rounded-lg border border-slate-100 bg-slate-50 text-xs flex justify-between items-center"
+                                      >
+                                        <div>
+                                          <div className="font-medium text-slate-800">{fee.costName}</div>
+                                          <div className="text-[10px] text-slate-400">
+                                            {formatPercent(fee.rate)}
+                                            {fee.isCategorySpecific && ' · Khusus Kategori'}
+                                            {fee.isSkuSpecific && ' · Khusus SKU'}
+                                          </div>
+                                        </div>
+                                        <div className="font-bold text-slate-900">
+                                          {formatIDR(fee.feeAmount)}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+
+                                  <div className="pt-2 flex justify-between text-xs font-semibold text-slate-800 border-t border-slate-100">
+                                    <span>Total Potongan Marketplace</span>
+                                    <span className="text-blue-700">
+                                      {formatIDR(econ.totalMarketplaceFee)} (
+                                      {formatPercent(econ.feeResult.effectiveFeeRate)})
+                                    </span>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800 flex items-center justify-between">
+                                  <div className="flex items-center space-x-2">
+                                    <AlertTriangle className="w-4 h-4 text-amber-600" />
+                                    <span>
+                                      Belum ada aturan biaya yang dikonfigurasi untuk marketplace ini.
+                                    </span>
+                                  </div>
+                                  <span className="font-semibold text-amber-900">
+                                    Potongan dihitung Rp 0
+                                  </span>
+                                </div>
+                              )}
+
+                              {/* Ads & BE ROAS Simulation Summary */}
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-100 text-xs">
+                                <div className="p-2.5 bg-slate-50 rounded-lg">
+                                  <span className="text-[10px] text-slate-400 block">
+                                    Est. Biaya Iklan (CIR {formatPercent(econ.cir)})
+                                  </span>
+                                  <span className="font-bold text-slate-900">
+                                    {formatIDR(econ.adsSpendPerUnit)}
+                                  </span>
+                                </div>
+                                <div className="p-2.5 bg-slate-50 rounded-lg">
+                                  <span className="text-[10px] text-slate-400 block">
+                                    Laba Setelah Iklan
+                                  </span>
+                                  <span
+                                    className={`font-bold ${
+                                      econ.profitAfterAds >= 0 ? 'text-emerald-700' : 'text-red-600'
+                                    }`}
+                                  >
+                                    {formatIDR(econ.profitAfterAds)} (
+                                    {formatPercent(econ.marginAfterAdsPct)})
+                                  </span>
+                                </div>
+                                <div className="p-2.5 bg-slate-50 rounded-lg">
+                                  <span className="text-[10px] text-slate-400 block">Break-Even ROAS</span>
+                                  <span className="font-extrabold text-slate-900">
+                                    {econ.beRoas ? `${econ.beRoas}x` : 'N/A (Organik)'}
+                                  </span>
+                                </div>
+                                <div className="p-2.5 bg-slate-50 rounded-lg">
+                                  <span className="text-[10px] text-slate-400 block">Kelayakan Iklan</span>
+                                  <span
+                                    className={`font-bold ${
+                                      econ.healthStatus === 'ADS_ELIGIBLE'
+                                        ? 'text-emerald-700'
+                                        : 'text-amber-700'
+                                    }`}
+                                  >
+                                    {econ.healthStatus === 'ADS_ELIGIBLE'
+                                      ? 'Aman Diklankan'
+                                      : 'Hanya Organik'}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Atur Kolom (Column Visibility Modal) */}
+      {showColumnModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Atur Tampilan Kolom</h3>
+                <p className="text-xs text-slate-500">Pilih kolom yang ingin ditampilkan pada tabel</p>
+              </div>
+              <button
+                onClick={() => setShowColumnModal(false)}
+                className="text-slate-400 hover:text-slate-600"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-xs max-h-72 overflow-y-auto p-1">
+              {[
+                { key: 'hpp', label: 'HPP' },
+                { key: 'selling_price', label: 'Harga Jual' },
+                { key: 'promo_price', label: 'Harga Promo' },
+                { key: 'admin_fee', label: 'Biaya Admin' },
+                { key: 'service_fee', label: 'Biaya Layanan' },
+                { key: 'payment_fee', label: 'Biaya Pembayaran' },
+                { key: 'shipping_fee', label: 'Gratis Ongkir' },
+                { key: 'voucher_fee', label: 'Voucher' },
+                { key: 'affiliate_fee', label: 'Affiliate' },
+                { key: 'campaign_fee', label: 'Campaign' },
+                { key: 'tax_fee', label: 'Pajak' },
+                { key: 'total_fee', label: 'Total Biaya' },
+                { key: 'net_profit', label: 'Laba Bersih' },
+                { key: 'net_margin', label: 'Net Margin' },
+                { key: 'roas', label: 'ROAS' },
+                { key: 'cir', label: 'CIR' },
+                { key: 'ads_status', label: 'Status Iklan' },
+              ].map(({ key, label }) => {
+                const k = key as keyof typeof visibleColumns;
+                const isChecked = visibleColumns[k];
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => toggleColumn(k)}
+                    className={`flex items-center justify-between p-2.5 rounded-lg border text-left transition-colors ${
+                      isChecked
+                        ? 'border-blue-300 bg-blue-50/50 text-blue-900 font-semibold'
+                        : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span>{label}</span>
+                    {isChecked && <Check className="w-3.5 h-3.5 text-blue-600" />}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="pt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowColumnModal(false)}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold"
+              >
+                Selesai
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -895,6 +1293,8 @@ export const ProductHub: React.FC<ProductHubProps> = ({
                     <option value="MKT-TOKOPEDIA">Tokopedia</option>
                     <option value="MKT-TIKTOK">TikTok Shop</option>
                     <option value="MKT-LAZADA">Lazada</option>
+                    <option value="MKT-BLIBLI">Blibli</option>
+                    <option value="MKT-CASH">Cash / Toko Langsung</option>
                   </select>
                 </div>
               </div>
@@ -935,9 +1335,6 @@ export const ProductHub: React.FC<ProductHubProps> = ({
                   onChange={(e) => setChanMinPrice(Number(e.target.value))}
                   className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs focus:outline-hidden focus:border-blue-500"
                 />
-                <span className="text-[11px] text-slate-400 mt-0.5 block">
-                  Peringatan otomatis muncul bila harga promo lebih rendah dari batas ini.
-                </span>
               </div>
 
               <div className="flex items-center space-x-2 pt-1">

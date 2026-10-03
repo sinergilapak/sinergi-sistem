@@ -142,7 +142,7 @@ export const ProductChannelCostEngine: React.FC<ProductChannelCostEngineProps> =
   }, [dbState.costRules, ruleMktFilter, ruleSearchQuery]);
 
   // Simulated Fees
-  const simulatedFees = useMemo(() => {
+  const simulatedFeeResult = useMemo(() => {
     const activePrograms = simIncludeOptional
       ? ['ALL_MANDATORY', 'FREE_SHIPPING', 'CASHBACK', 'ALL']
       : ['ALL_MANDATORY'];
@@ -159,7 +159,7 @@ export const ProductChannelCostEngine: React.FC<ProductChannelCostEngineProps> =
     );
   }, [simPrice, simMarketplace, simIncludeOptional, dbState.costRules]);
 
-  const totalSimulatedFee = simulatedFees.reduce((acc, f) => acc + f.feeAmount, 0);
+  const totalSimulatedFee = simulatedFeeResult.totalFeeAmount;
   const simNetRevenue = simPrice - totalSimulatedFee;
   const simFeePct = simPrice > 0 ? totalSimulatedFee / simPrice : 0;
 
@@ -900,7 +900,7 @@ export const ProductChannelCostEngine: React.FC<ProductChannelCostEngineProps> =
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
             <div className="p-4 border-b border-slate-100 flex items-center justify-between">
               <h3 className="text-sm font-bold text-slate-900">
-                Rincian Biaya yang Berlaku ({simulatedFees.length} Komponen Biaya)
+                Rincian Biaya yang Berlaku ({simulatedFeeResult.fees.length} Komponen Biaya)
               </h3>
             </div>
             <div className="overflow-x-auto">
@@ -915,7 +915,7 @@ export const ProductChannelCostEngine: React.FC<ProductChannelCostEngineProps> =
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {simulatedFees.map((f) => (
+                  {simulatedFeeResult.fees.map((f) => (
                     <tr key={f.ruleId} className="hover:bg-slate-50/80">
                       <td className="py-3 px-4 font-mono font-bold text-slate-700">{f.ruleId}</td>
                       <td className="py-3 px-4 font-medium text-slate-900">{f.costName}</td>
