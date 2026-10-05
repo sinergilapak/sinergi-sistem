@@ -1,17 +1,30 @@
 /**
- * Sinergi Lapak - Cost Rule Engine (src/utils/costRules.ts)
- * 
- * Implements dynamic marketplace fee calculations governed by:
- * - Requirements 5: Dynamic fees per category/subcategory/brand/SPU/SKU/unit/program/date
- *                   Warning "Biaya belum diatur" when no rules exist (do not silently default to 0%)
- * - Requirements 6: Strict Priority Hierarchy lookup:
- *                   SKU (Level 6) -> SPU (Level 5) -> Brand (Level 4) -> Category (Level 3) -> 
- *                   Marketplace/Unit (Level 2) -> Default (Level 1)
- *                   Within the same cost group/type, the most specific rule overrides general rules.
- *                   Distinct cost types (Admin, Layanan, Pembayaran, Gratis Ongkir, dll) are aggregated.
+ * Sinergi Lapak - Dynamic Cost Rule Engine (Patch V2)
+ *
+ * Implements priority-based rule lookup:
+ * Priority: SKU > SPU > Brand > Category > Marketplace/Unit > Default
+ *
+ * Features:
+ * - Dynamic marketplace fee calculation based on SKU, SPU, Brand, Category, Unit, Marketplace, Program, and Effective Period.
+ * - Granular override: Within the SAME cost group/canonical component, the more specific rule overrides the general rule.
+ * - Distinct fee components (Admin, Layanan, Pembayaran, Gratis Ongkir, Voucher, Affiliate, Campaign, Cashback, Pajak)
+ *   are properly aggregated.
+ * - Warning flag ("Biaya belum diatur") when no valid cost rule is configured for the category/marketplace.
  */
 
 import { CostRuleRecord } from '../types/database';
+
+export type PriorityTier = 'SKU' | 'SPU' | 'BRAND' | 'CATEGORY' | 'UNIT' | 'MARKETPLACE' | 'DEFAULT';
+
+export const PRIORITY_WEIGHTS: Record<PriorityTier, number> = {
+  SKU: 600,
+  SPU: 500,
+  BRAND: 400,
+  CATEGORY: 300,
+  UNIT: 200,
+  MARKETPLACE: 100,
+  DEFAULT: 10,
+};
 
 export type CanonicalFeeType =
   | 'ADMIN_FEE'
@@ -25,15 +38,6 @@ export type CanonicalFeeType =
   | 'TAX'
   | 'OTHER';
 
-export enum SpecificityTier {
-  SKU = 6,
-  SPU = 5,
-  BRAND = 4,
-  CATEGORY = 3,
-  UNIT = 2,
-  DEFAULT = 1,
-}
-
 export interface CostRuleLookupContext {
   sellingPrice: number;
   marketplaceId: string;
@@ -42,12 +46,12 @@ export interface CostRuleLookupContext {
   spuId?: string | null;
   sku?: string | null;
   unitId?: string | null;
-  effectiveDate?: string | Date;
+  date?: string | Date;
   activePrograms?: string[];
   qty?: number;
 }
 
-export interface MarketplaceFeeItem {
+export interface CalculatedFeeItem {
   ruleId: string;
   costName: string;
   costGroup: string;
@@ -57,14 +61,16 @@ export interface MarketplaceFeeItem {
   fixedAmount: number;
   mandatory: boolean;
   program?: string | null;
+  priorityTier: PriorityTier;
   specificityScore: number;
-  specificityLevel: 'SKU' | 'SPU' | 'BRAND' | 'CATEGORY' | 'UNIT' | 'DEFAULT';
   isCategorySpecific: boolean;
   isSkuSpecific: boolean;
-  matchedBy: string;
+  isSpuSpecific: boolean;
+  isBrandSpecific: boolean;
+  matchedRule: CostRuleRecord;
 }
 
-export interface MarketplaceFeeBreakdown {
+export interface FeeBreakdown {
   adminFee: number;
   serviceFee: number;
   paymentFee: number;
@@ -77,35 +83,48 @@ export interface MarketplaceFeeBreakdown {
   otherFee: number;
 }
 
-export interface MarketplaceFeeCalculationResult {
-  fees: MarketplaceFeeItem[];
+export interface DynamicFeeCalculationResult {
+  fees: CalculatedFeeItem[];
   totalFeeAmount: number;
   effectiveFeeRate: number;
   hasConfiguredFees: boolean;
   warning?: string;
-  breakdown: MarketplaceFeeBreakdown;
-  lookupDetails?: {
-    marketplaceId: string;
-    rulesEvaluated: number;
-    rulesMatched: number;
-    resolvedTier: string;
-  };
+  breakdown: FeeBreakdown;
+  appliedTiers: PriorityTier[];
 }
 
 /**
- * Normalizes and categorizes a cost rule name or group into its canonical fee type.
+ * Categorize any cost rule name and group into canonical fee types
  */
-export function getCanonicalCostType(costName: string, costGroup: string): CanonicalFeeType {
+export function getCanonicalCostType(
+  costName: string,
+  costGroup: string
+): CanonicalFeeType {
   const normName = costName.toLowerCase().trim();
   const normGroup = costGroup.toUpperCase().trim();
 
-  if (normName.includes('admin') || normGroup === 'ADMIN_FEE' || (normGroup === 'PLATFORM_FEE' && normName.includes('admin'))) {
+  if (
+    normName.includes('admin') ||
+    normGroup === 'ADMIN_FEE' ||
+    (normGroup === 'PLATFORM_FEE' && normName.includes('admin'))
+  ) {
     return 'ADMIN_FEE';
   }
-  if (normName.includes('pembayaran') || normName.includes('transaksi') || normGroup === 'PAYMENT_FEE') {
+  if (
+    normName.includes('pembayaran') ||
+    normName.includes('transaksi') ||
+    normName.includes('payment') ||
+    normGroup === 'PAYMENT_FEE'
+  ) {
     return 'PAYMENT_FEE';
   }
-  if (normName.includes('gratis ongkir') || normName.includes('ongkir') || normGroup === 'SHIPPING_PROGRAM' || normGroup === 'SHIPPING_FEE') {
+  if (
+    normName.includes('gratis ongkir') ||
+    normName.includes('ongkir') ||
+    normName.includes('shipping') ||
+    normGroup === 'SHIPPING_PROGRAM' ||
+    normGroup === 'SHIPPING_FEE'
+  ) {
     return 'FREE_SHIPPING';
   }
   if (normName.includes('voucher') || normGroup === 'VOUCHER') {
@@ -114,40 +133,56 @@ export function getCanonicalCostType(costName: string, costGroup: string): Canon
   if (normName.includes('affiliate') || normName.includes('afiliasi') || normGroup === 'AFFILIATE') {
     return 'AFFILIATE';
   }
-  if (normName.includes('campaign') || normName.includes('flash sale') || normName.includes('promo') || normGroup === 'CAMPAIGN') {
+  if (
+    normName.includes('campaign') ||
+    normName.includes('flash sale') ||
+    normName.includes('promo') ||
+    normGroup === 'CAMPAIGN'
+  ) {
     return 'CAMPAIGN';
   }
   if (normName.includes('cashback') || normGroup === 'CASHBACK') {
     return 'CASHBACK';
   }
-  if (normName.includes('pajak') || normName.includes('ppn') || normName.includes('pph') || normGroup === 'TAX') {
+  if (
+    normName.includes('pajak') ||
+    normName.includes('ppn') ||
+    normName.includes('pph') ||
+    normName.includes('tax') ||
+    normGroup === 'TAX'
+  ) {
     return 'TAX';
   }
-  if (normName.includes('layanan') || normGroup === 'SERVICE_FEE' || normGroup === 'PLATFORM_FEE') {
+  if (
+    normName.includes('layanan') ||
+    normName.includes('service') ||
+    normGroup === 'SERVICE_FEE' ||
+    normGroup === 'PLATFORM_FEE'
+  ) {
     return 'SERVICE_FEE';
   }
   return 'OTHER';
 }
 
 /**
- * Checks if a rule is valid for a given target date.
+ * Check if a cost rule is active and within effective dates
  */
-export function isCostRuleEffective(rule: CostRuleRecord, targetDate: Date | string = new Date()): boolean {
+export function isCostRuleEffective(rule: CostRuleRecord, targetDate: string | Date = new Date()): boolean {
   if (!rule.active) return false;
 
-  const dateObj = typeof targetDate === 'string' ? new Date(targetDate) : targetDate;
-  const targetTime = dateObj.getTime();
+  const checkTime = typeof targetDate === 'string' ? new Date(targetDate).getTime() : targetDate.getTime();
+  if (isNaN(checkTime)) return rule.active;
 
   if (rule.effective_from) {
     const fromTime = new Date(rule.effective_from).getTime();
-    if (!isNaN(fromTime) && targetTime < fromTime) {
+    if (!isNaN(fromTime) && checkTime < fromTime) {
       return false;
     }
   }
 
   if (rule.effective_to) {
     const toTime = new Date(rule.effective_to).getTime();
-    if (!isNaN(toTime) && targetTime > toTime) {
+    if (!isNaN(toTime) && checkTime > toTime) {
       return false;
     }
   }
@@ -156,58 +191,62 @@ export function isCostRuleEffective(rule: CostRuleRecord, targetDate: Date | str
 }
 
 /**
- * Calculates specificity score based on priority hierarchy:
- * SKU (Score 500,000) > SPU (400,000) > Brand (300,000) > Category (200,000) > Unit (100,000) > Default (10,000)
- * Plus rule priority (0-999) for fine-grained ties.
+ * Determine rule priority tier and specificity score.
+ * Hierarchy:
+ * SKU (Priority 6) > SPU (Priority 5) > Brand (Priority 4) > Category (Priority 3) > Unit (Priority 2) > Marketplace/Default (Priority 1)
  */
-export function calculateRuleSpecificity(
-  rule: CostRuleRecord,
-  context: CostRuleLookupContext
-): { score: number; tier: SpecificityTier; tierLabel: 'SKU' | 'SPU' | 'BRAND' | 'CATEGORY' | 'UNIT' | 'DEFAULT'; matchedBy: string } {
+export function evaluateRulePriority(rule: CostRuleRecord): {
+  tier: PriorityTier;
+  score: number;
+  isSku: boolean;
+  isSpu: boolean;
+  isBrand: boolean;
+  isCategory: boolean;
+  isUnit: boolean;
+} {
   let score = rule.priority || 50;
-  let tier = SpecificityTier.DEFAULT;
-  let tierLabel: 'SKU' | 'SPU' | 'BRAND' | 'CATEGORY' | 'UNIT' | 'DEFAULT' = 'DEFAULT';
-  let matchedBy = 'Marketplace Default';
+  let tier: PriorityTier = 'DEFAULT';
 
-  if (rule.sku && context.sku && rule.sku.toUpperCase() === context.sku.toUpperCase()) {
-    score += 500000;
-    tier = SpecificityTier.SKU;
-    tierLabel = 'SKU';
-    matchedBy = `SKU: ${rule.sku}`;
-  } else if (rule.spu_id && context.spuId && rule.spu_id === context.spuId) {
-    score += 400000;
-    tier = SpecificityTier.SPU;
-    tierLabel = 'SPU';
-    matchedBy = `SPU: ${rule.spu_id}`;
-  } else if (rule.brand_id && context.brandId && rule.brand_id === context.brandId) {
-    score += 300000;
-    tier = SpecificityTier.BRAND;
-    tierLabel = 'BRAND';
-    matchedBy = `Brand: ${rule.brand_id}`;
-  } else if (rule.category_id && context.categoryId && rule.category_id === context.categoryId) {
-    score += 200000;
-    tier = SpecificityTier.CATEGORY;
-    tierLabel = 'CATEGORY';
-    matchedBy = `Category: ${rule.category_id}`;
-  } else if (rule.unit_id && context.unitId && rule.unit_id === context.unitId) {
-    score += 100000;
-    tier = SpecificityTier.UNIT;
-    tierLabel = 'UNIT';
-    matchedBy = `Unit: ${rule.unit_id}`;
+  const isSku = Boolean(rule.sku && rule.sku.trim() !== '');
+  const isSpu = Boolean(rule.spu_id && rule.spu_id.trim() !== '');
+  const isBrand = Boolean(rule.brand_id && rule.brand_id.trim() !== '');
+  const isCategory = Boolean(rule.category_id && rule.category_id.trim() !== '');
+  const isUnit = Boolean(rule.unit_id && rule.unit_id.trim() !== '');
+
+  if (isSku) {
+    tier = 'SKU';
+    score += PRIORITY_WEIGHTS.SKU;
+  } else if (isSpu) {
+    tier = 'SPU';
+    score += PRIORITY_WEIGHTS.SPU;
+  } else if (isBrand) {
+    tier = 'BRAND';
+    score += PRIORITY_WEIGHTS.BRAND;
+  } else if (isCategory) {
+    tier = 'CATEGORY';
+    score += PRIORITY_WEIGHTS.CATEGORY;
+  } else if (isUnit) {
+    tier = 'UNIT';
+    score += PRIORITY_WEIGHTS.UNIT;
+  } else if (rule.marketplace_id && rule.marketplace_id !== 'ALL') {
+    tier = 'MARKETPLACE';
+    score += PRIORITY_WEIGHTS.MARKETPLACE;
   } else {
-    score += 10000;
-    tier = SpecificityTier.DEFAULT;
-    tierLabel = 'DEFAULT';
-    matchedBy = 'Marketplace Standard';
+    tier = 'DEFAULT';
+    score += PRIORITY_WEIGHTS.DEFAULT;
   }
 
-  return { score, tier, tierLabel, matchedBy };
+  return { tier, score, isSku, isSpu, isBrand, isCategory, isUnit };
 }
 
 /**
- * Computes fee for a single cost rule based on calculation type and price/qty.
+ * Calculate amount for a specific rule based on its calculation type
  */
-export function calculateSingleRuleFee(basePrice: number, rule: CostRuleRecord, qty: number = 1): number {
+export function calculateSingleRuleAmount(
+  basePrice: number,
+  rule: CostRuleRecord,
+  qty: number = 1
+): number {
   let base = basePrice;
   if (rule.calculation_base === 'QTY') {
     base = qty;
@@ -217,29 +256,29 @@ export function calculateSingleRuleFee(basePrice: number, rule: CostRuleRecord, 
 
   switch (rule.calculation_type) {
     case 'PERCENTAGE':
-      calculated = base * rule.rate;
+      calculated = base * (rule.rate || 0);
       break;
 
     case 'FIXED':
-      calculated = rule.fixed_amount;
+      calculated = rule.fixed_amount || 0;
       break;
 
     case 'PERCENTAGE_MAX':
-      calculated = base * rule.rate;
+      calculated = base * (rule.rate || 0);
       if (rule.maximum_fee !== null && rule.maximum_fee !== undefined && rule.maximum_fee > 0) {
         calculated = Math.min(calculated, rule.maximum_fee);
       }
       break;
 
     case 'PERCENTAGE_MIN':
-      calculated = base * rule.rate;
+      calculated = base * (rule.rate || 0);
       if (rule.minimum_fee !== null && rule.minimum_fee !== undefined && rule.minimum_fee > 0) {
         calculated = Math.max(calculated, rule.minimum_fee);
       }
       break;
 
     case 'PERCENTAGE_MIN_MAX':
-      calculated = base * rule.rate;
+      calculated = base * (rule.rate || 0);
       if (rule.minimum_fee !== null && rule.minimum_fee !== undefined && rule.minimum_fee > 0) {
         calculated = Math.max(calculated, rule.minimum_fee);
       }
@@ -249,49 +288,55 @@ export function calculateSingleRuleFee(basePrice: number, rule: CostRuleRecord, 
       break;
 
     case 'FIXED_PERCENTAGE':
-      calculated = rule.fixed_amount + base * rule.rate;
+      calculated = (rule.fixed_amount || 0) + base * (rule.rate || 0);
       break;
 
     case 'TIER':
       if (rule.range_to && base > rule.range_to) {
-        calculated = base * (rule.rate * 0.8);
+        calculated = base * ((rule.rate || 0) * 0.8);
       } else {
-        calculated = base * rule.rate;
+        calculated = base * (rule.rate || 0);
       }
       break;
 
     default:
-      calculated = base * rule.rate;
+      calculated = base * (rule.rate || 0);
+      break;
   }
 
   return Math.round(calculated);
 }
 
 /**
- * Main Cost Rule Engine:
- * Resolves priority-based marketplace cost rules (SKU > SPU > Brand > Category > Unit > Default)
- * Aggregates distinct cost groups (Admin, Payment, Shipping, Tax, etc.) while overriding duplicates
- * within the same group.
+ * Main Cost Rule Engine Lookup Function
+ *
+ * Implements strict priority-based matching:
+ * 1. Filter active & date-effective rules for target marketplace.
+ * 2. Match filters: SKU > SPU > Brand > Category > Unit.
+ * 3. Group rules by Canonical Fee Component and specific cost name.
+ * 4. In each group, the rule with the highest specificity score wins (override).
+ * 5. Distinct fee components are summed together.
+ * 6. If no rules exist or none matched, flag warning "Biaya belum diatur" (do not silently assume 0%).
  */
-export function calculateDynamicMarketplaceFees(
+export function calculateDynamicCostRules(
   context: CostRuleLookupContext,
   allRules: CostRuleRecord[]
-): MarketplaceFeeCalculationResult {
+): DynamicFeeCalculationResult {
   const {
     sellingPrice,
     marketplaceId,
-    categoryId,
-    brandId,
-    spuId,
-    sku,
-    unitId,
-    effectiveDate = new Date(),
+    categoryId = '',
+    brandId = '',
+    spuId = '',
+    sku = '',
+    unitId = '',
+    date = new Date(),
     activePrograms = ['ALL_MANDATORY', 'FREE_SHIPPING', 'CASHBACK', 'ALL'],
     qty = 1,
   } = context;
 
-  // Direct offline / cash sales have 0% marketplace fees
-  if (marketplaceId === 'MKT-CASH' || marketplaceId === 'CASH') {
+  // Direct cash or offline channels have intentionally 0 fee
+  if (marketplaceId === 'MKT-CASH' || marketplaceId === 'DIRECT') {
     return {
       fees: [],
       totalFeeAmount: 0,
@@ -309,20 +354,18 @@ export function calculateDynamicMarketplaceFees(
         taxFee: 0,
         otherFee: 0,
       },
-      lookupDetails: {
-        marketplaceId,
-        rulesEvaluated: 0,
-        rulesMatched: 0,
-        resolvedTier: 'DIRECT_OFFLINE',
-      },
+      appliedTiers: ['DEFAULT'],
     };
   }
 
-  // 1. Filter rules matching marketplace and validity period
-  const candidateRules = allRules.filter(
-    (r) => r.marketplace_id === marketplaceId && isCostRuleEffective(r, effectiveDate)
-  );
+  // 1. Filter active and date-effective rules for marketplace
+  const candidateRules = allRules.filter((r) => {
+    if (!r.active) return false;
+    if (r.marketplace_id !== 'ALL' && r.marketplace_id !== marketplaceId) return false;
+    return isCostRuleEffective(r, date);
+  });
 
+  // If absolutely no rules exist for this marketplace
   if (candidateRules.length === 0) {
     return {
       fees: [],
@@ -342,80 +385,66 @@ export function calculateDynamicMarketplaceFees(
         taxFee: 0,
         otherFee: 0,
       },
-      lookupDetails: {
-        marketplaceId,
-        rulesEvaluated: allRules.length,
-        rulesMatched: 0,
-        resolvedTier: 'NONE',
-      },
+      appliedTiers: [],
     };
   }
 
-  // 2. Evaluate match criteria for each candidate rule
-  interface WinningEntry {
+  // 2. Evaluate matches and resolve overrides per component
+  // Key format: canonicalType_costName
+  interface WinningRuleEntry {
     rule: CostRuleRecord;
+    tier: PriorityTier;
     score: number;
-    tier: SpecificityTier;
-    tierLabel: 'SKU' | 'SPU' | 'BRAND' | 'CATEGORY' | 'UNIT' | 'DEFAULT';
-    matchedBy: string;
     isSku: boolean;
+    isSpu: boolean;
+    isBrand: boolean;
     isCategory: boolean;
   }
 
-  const winningRules = new Map<string, WinningEntry>();
-  let rulesMatchedCount = 0;
+  const winningRules = new Map<string, WinningRuleEntry>();
 
   for (const rule of candidateRules) {
-    // Exact hierarchy match:
-    // If rule specifies a filter, it MUST match the context.
-    const ruleSkuNorm = rule.sku?.trim().toUpperCase();
-    const contextSkuNorm = sku?.trim().toUpperCase();
-    const matchesSku = !ruleSkuNorm || (Boolean(contextSkuNorm) && ruleSkuNorm === contextSkuNorm);
-
-    const matchesSpu = !rule.spu_id || (Boolean(spuId) && rule.spu_id === spuId);
-    const matchesBrand = !rule.brand_id || (Boolean(brandId) && rule.brand_id === brandId);
-    const matchesCategory = !rule.category_id || (Boolean(categoryId) && rule.category_id === categoryId);
-    const matchesUnit = !rule.unit_id || (Boolean(unitId) && rule.unit_id === unitId);
+    // Check match criteria
+    const matchesSku = !rule.sku || (sku && rule.sku.toUpperCase().trim() === sku.toUpperCase().trim());
+    const matchesSpu = !rule.spu_id || (spuId && rule.spu_id === spuId);
+    const matchesBrand = !rule.brand_id || (brandId && rule.brand_id === brandId);
+    const matchesCategory = !rule.category_id || (categoryId && rule.category_id === categoryId);
+    const matchesUnit = !rule.unit_id || (unitId && rule.unit_id === unitId);
 
     if (matchesSku && matchesSpu && matchesBrand && matchesCategory && matchesUnit) {
-      // Program inclusion check for non-mandatory optional fees
+      // Check program inclusion
       if (!rule.mandatory && rule.program) {
-        const isProgramActive =
-          activePrograms.includes(rule.program) || activePrograms.includes('ALL');
-        if (!isProgramActive) {
+        if (!activePrograms.includes(rule.program) && !activePrograms.includes('ALL')) {
           continue;
         }
       }
 
-      rulesMatchedCount++;
-
-      // Compute specificity
-      const { score, tier, tierLabel, matchedBy } = calculateRuleSpecificity(rule, context);
+      const priorityInfo = evaluateRulePriority(rule);
       const canonicalType = getCanonicalCostType(rule.cost_name, rule.cost_group);
 
-      // Overriding key: Combine canonicalType with cost name to allow distinct fees of same group,
-      // but override exact same component (e.g. general Admin Fee vs Electronics Category Admin Fee)
-      const costNameKey = rule.cost_name.toLowerCase().replace(/kategori.*$/i, '').trim();
-      const groupKey = `${canonicalType}__${costNameKey}`;
+      // Grouping key: we group by canonicalType + normalized costName
+      // so specific category admin fee overrides general admin fee,
+      // but admin fee and service fee are separate and cumulative.
+      const groupKey = `${canonicalType}_${rule.cost_name.toLowerCase().trim()}`;
 
       const existing = winningRules.get(groupKey);
-      if (!existing || score > existing.score) {
+      if (!existing || priorityInfo.score > existing.score) {
         winningRules.set(groupKey, {
           rule,
-          score,
-          tier,
-          tierLabel,
-          matchedBy,
-          isSku: tier === SpecificityTier.SKU,
-          isCategory: tier === SpecificityTier.CATEGORY,
+          tier: priorityInfo.tier,
+          score: priorityInfo.score,
+          isSku: priorityInfo.isSku,
+          isSpu: priorityInfo.isSpu,
+          isBrand: priorityInfo.isBrand,
+          isCategory: priorityInfo.isCategory,
         });
       }
     }
   }
 
-  // 3. Compute amounts from winning rules
-  const feeItems: MarketplaceFeeItem[] = [];
-  const breakdown: MarketplaceFeeBreakdown = {
+  // 3. Assemble results and breakdown
+  const items: CalculatedFeeItem[] = [];
+  const breakdown: FeeBreakdown = {
     adminFee: 0,
     serviceFee: 0,
     paymentFee: 0,
@@ -428,19 +457,15 @@ export function calculateDynamicMarketplaceFees(
     otherFee: 0,
   };
 
-  let maxTierLabel: string = 'DEFAULT';
-  let maxTierValue = SpecificityTier.DEFAULT;
+  const appliedTiersSet = new Set<PriorityTier>();
 
-  winningRules.forEach(({ rule, score, tier, tierLabel, matchedBy, isSku, isCategory }) => {
-    const feeAmount = calculateSingleRuleFee(sellingPrice, rule, qty);
+  winningRules.forEach(({ rule, tier, score, isSku, isSpu, isBrand, isCategory }) => {
+    const feeAmount = calculateSingleRuleAmount(sellingPrice, rule, qty);
     const canonicalType = getCanonicalCostType(rule.cost_name, rule.cost_group);
 
-    if (tier > maxTierValue) {
-      maxTierValue = tier;
-      maxTierLabel = tierLabel;
-    }
+    appliedTiersSet.add(tier);
 
-    feeItems.push({
+    items.push({
       ruleId: rule.rule_id,
       costName: rule.cost_name,
       costGroup: rule.cost_group,
@@ -450,11 +475,13 @@ export function calculateDynamicMarketplaceFees(
       fixedAmount: rule.fixed_amount,
       mandatory: rule.mandatory,
       program: rule.program,
+      priorityTier: tier,
       specificityScore: score,
-      specificityLevel: tierLabel,
       isCategorySpecific: isCategory,
       isSkuSpecific: isSku,
-      matchedBy,
+      isSpuSpecific: isSpu,
+      isBrandSpecific: isBrand,
+      matchedRule: rule,
     });
 
     switch (canonicalType) {
@@ -491,44 +518,36 @@ export function calculateDynamicMarketplaceFees(
     }
   });
 
-  const totalFeeAmount = feeItems.reduce((acc, it) => acc + it.feeAmount, 0);
+  const totalFeeAmount = items.reduce((acc, it) => acc + it.feeAmount, 0);
   const effectiveFeeRate = sellingPrice > 0 ? totalFeeAmount / sellingPrice : 0;
-  const hasConfiguredFees = feeItems.length > 0;
+  const hasConfiguredFees = items.length > 0;
 
   return {
-    fees: feeItems,
+    fees: items,
     totalFeeAmount,
     effectiveFeeRate,
     hasConfiguredFees,
-    warning: !hasConfiguredFees
-      ? 'Biaya belum diatur untuk produk/kategori ini'
-      : undefined,
+    warning: hasConfiguredFees ? undefined : 'Biaya belum diatur untuk kategori/produk ini',
     breakdown,
-    lookupDetails: {
-      marketplaceId,
-      rulesEvaluated: candidateRules.length,
-      rulesMatched: rulesMatchedCount,
-      resolvedTier: maxTierLabel,
-    },
+    appliedTiers: Array.from(appliedTiersSet),
   };
 }
 
 /**
- * Backward-compatible helper matching legacy function signature:
- * getApplicableMarketplaceFees(sellingPrice, marketplaceId, categoryId, brandId, spuId, skuCode, unitId, allRules, activePrograms)
+ * Backward compatibility wrapper matching existing getApplicableMarketplaceFees signature
  */
-export function getApplicableMarketplaceFees(
+export function getApplicableMarketplaceFeesFromRules(
   sellingPrice: number,
   marketplaceId: string,
-  categoryId: string = '',
-  brandId: string = '',
-  spuId: string = '',
-  skuCode: string = '',
-  unitId: string = '',
-  allRules: CostRuleRecord[] = [],
+  categoryId: string,
+  brandId: string,
+  spuId: string,
+  skuCode: string,
+  unitId: string,
+  allRules: CostRuleRecord[],
   activePrograms: string[] = ['ALL_MANDATORY', 'FREE_SHIPPING', 'CASHBACK', 'ALL']
-): MarketplaceFeeCalculationResult {
-  return calculateDynamicMarketplaceFees(
+): DynamicFeeCalculationResult {
+  return calculateDynamicCostRules(
     {
       sellingPrice,
       marketplaceId,

@@ -15,6 +15,8 @@ import {
   FinancialType,
   AllocationMethod,
 } from '../types/database';
+import { calculateDynamicCostRules } from './costRules';
+export * from './costRules';
 
 export interface MarketplaceFeeItem {
   ruleId: string;
@@ -259,182 +261,19 @@ export function getApplicableMarketplaceFees(
   allRules: CostRuleRecord[],
   activePrograms: string[] = ['ALL_MANDATORY', 'FREE_SHIPPING', 'CASHBACK', 'ALL']
 ): MarketplaceFeeCalculationResult {
-  // If cash / direct channel, 0 fee
-  if (marketplaceId === 'MKT-CASH') {
-    return {
-      fees: [],
-      totalFeeAmount: 0,
-      effectiveFeeRate: 0,
-      hasConfiguredFees: true,
-      breakdown: {
-        adminFee: 0,
-        serviceFee: 0,
-        paymentFee: 0,
-        freeShippingFee: 0,
-        voucherFee: 0,
-        affiliateFee: 0,
-        campaignFee: 0,
-        cashbackFee: 0,
-        taxFee: 0,
-        otherFee: 0,
-      },
-    };
-  }
-
-  // Filter rules for this marketplace
-  const mktRules = allRules.filter((r) => r.active && r.marketplace_id === marketplaceId);
-
-  if (mktRules.length === 0) {
-    return {
-      fees: [],
-      totalFeeAmount: 0,
-      effectiveFeeRate: 0,
-      hasConfiguredFees: false,
-      warning: 'Biaya belum diatur untuk marketplace ini',
-      breakdown: {
-        adminFee: 0,
-        serviceFee: 0,
-        paymentFee: 0,
-        freeShippingFee: 0,
-        voucherFee: 0,
-        affiliateFee: 0,
-        campaignFee: 0,
-        cashbackFee: 0,
-        taxFee: 0,
-        otherFee: 0,
-      },
-    };
-  }
-
-  // Map of canonical cost type to winning rule
-  const winningRules = new Map<
-    string,
-    { rule: CostRuleRecord; score: number; isCategory: boolean; isSku: boolean }
-  >();
-
-  for (const rule of mktRules) {
-    // Check match criteria
-    const matchesSku = !rule.sku || rule.sku.toUpperCase() === skuCode.toUpperCase();
-    const matchesSpu = !rule.spu_id || rule.spu_id === spuId;
-    const matchesBrand = !rule.brand_id || rule.brand_id === brandId;
-    const matchesCategory = !rule.category_id || rule.category_id === categoryId;
-    const matchesUnit = !rule.unit_id || rule.unit_id === unitId;
-
-    if (matchesSku && matchesSpu && matchesBrand && matchesCategory && matchesUnit) {
-      // Check program inclusion
-      if (!rule.mandatory && rule.program) {
-        if (!activePrograms.includes(rule.program) && !activePrograms.includes('ALL')) {
-          continue;
-        }
-      }
-
-      // Compute specificity score:
-      // SKU (500) > SPU (400) > Brand (300) > Category (200) > Unit (100) > Mkt (10)
-      let score = rule.priority || 50;
-      let isSku = false;
-      let isCat = false;
-
-      if (rule.sku) {
-        score += 500;
-        isSku = true;
-      }
-      if (rule.spu_id) score += 400;
-      if (rule.brand_id) score += 300;
-      if (rule.category_id) {
-        score += 200;
-        isCat = true;
-      }
-      if (rule.unit_id) score += 100;
-
-      // Group key: Combine canonical type and cost name for granular override
-      const canonicalType = getCanonicalCostType(rule.cost_name, rule.cost_group);
-      const groupKey = `${canonicalType}_${rule.cost_name.toLowerCase().trim()}`;
-
-      const existing = winningRules.get(groupKey);
-      if (!existing || score > existing.score) {
-        winningRules.set(groupKey, { rule, score, isCategory: isCat, isSku });
-      }
-    }
-  }
-
-  const items: MarketplaceFeeItem[] = [];
-  const breakdown = {
-    adminFee: 0,
-    serviceFee: 0,
-    paymentFee: 0,
-    freeShippingFee: 0,
-    voucherFee: 0,
-    affiliateFee: 0,
-    campaignFee: 0,
-    cashbackFee: 0,
-    taxFee: 0,
-    otherFee: 0,
-  };
-
-  winningRules.forEach(({ rule, score, isCategory, isSku }) => {
-    const feeAmount = calculateRuleFee(sellingPrice, rule);
-    const canonicalType = getCanonicalCostType(rule.cost_name, rule.cost_group);
-
-    items.push({
-      ruleId: rule.rule_id,
-      costName: rule.cost_name,
-      costGroup: rule.cost_group,
-      canonicalType,
-      feeAmount,
-      rate: rule.rate,
-      fixedAmount: rule.fixed_amount,
-      mandatory: rule.mandatory,
-      program: rule.program,
-      specificityScore: score,
-      isCategorySpecific: isCategory,
-      isSkuSpecific: isSku,
-    });
-
-    switch (canonicalType) {
-      case 'ADMIN_FEE':
-        breakdown.adminFee += feeAmount;
-        break;
-      case 'SERVICE_FEE':
-        breakdown.serviceFee += feeAmount;
-        break;
-      case 'PAYMENT_FEE':
-        breakdown.paymentFee += feeAmount;
-        break;
-      case 'FREE_SHIPPING':
-        breakdown.freeShippingFee += feeAmount;
-        break;
-      case 'VOUCHER':
-        breakdown.voucherFee += feeAmount;
-        break;
-      case 'AFFILIATE':
-        breakdown.affiliateFee += feeAmount;
-        break;
-      case 'CAMPAIGN':
-        breakdown.campaignFee += feeAmount;
-        break;
-      case 'CASHBACK':
-        breakdown.cashbackFee += feeAmount;
-        break;
-      case 'TAX':
-        breakdown.taxFee += feeAmount;
-        break;
-      default:
-        breakdown.otherFee += feeAmount;
-        break;
-    }
-  });
-
-  const totalFeeAmount = items.reduce((acc, it) => acc + it.feeAmount, 0);
-  const effectiveFeeRate = sellingPrice > 0 ? totalFeeAmount / sellingPrice : 0;
-
-  return {
-    fees: items,
-    totalFeeAmount,
-    effectiveFeeRate,
-    hasConfiguredFees: items.length > 0,
-    warning: items.length === 0 ? 'Biaya belum diatur untuk produk/kategori ini' : undefined,
-    breakdown,
-  };
+  return calculateDynamicCostRules(
+    {
+      sellingPrice,
+      marketplaceId,
+      categoryId,
+      brandId,
+      spuId,
+      sku: skuCode,
+      unitId,
+      activePrograms,
+    },
+    allRules
+  );
 }
 
 /**

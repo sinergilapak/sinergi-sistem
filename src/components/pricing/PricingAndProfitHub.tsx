@@ -15,6 +15,9 @@ import {
   X,
   ArrowRight,
   ShieldCheck,
+  Sparkles,
+  Info,
+  Layers,
 } from 'lucide-react';
 import {
   DatabaseState,
@@ -23,9 +26,34 @@ import {
 } from '../../types/database';
 import { storageService } from '../../services/storageService';
 import { formatIDR, formatPercent } from '../../utils/validation';
-import { getApplicableMarketplaceFees } from '../../utils/financialEngine';
+import {
+  calculateDynamicCostRules,
+  DynamicFeeCalculationResult,
+  CalculatedFeeItem,
+  PriorityTier,
+} from '../../utils/costRules';
+import { CostRuleHierarchySection } from './CostRuleHierarchySection';
 
 export type PricingSubTab = 'calculator' | 'fees' | 'ads_sim';
+
+const getTierBadge = (tier: PriorityTier) => {
+  switch (tier) {
+    case 'SKU':
+      return { bg: 'bg-purple-50 text-purple-700 border-purple-200', label: 'Level 6: SKU' };
+    case 'SPU':
+      return { bg: 'bg-indigo-50 text-indigo-700 border-indigo-200', label: 'Level 5: SPU' };
+    case 'BRAND':
+      return { bg: 'bg-blue-50 text-blue-700 border-blue-200', label: 'Level 4: Brand' };
+    case 'CATEGORY':
+      return { bg: 'bg-emerald-50 text-emerald-700 border-emerald-200', label: 'Level 3: Kategori' };
+    case 'UNIT':
+      return { bg: 'bg-amber-50 text-amber-700 border-amber-200', label: 'Level 2: Unit' };
+    case 'MARKETPLACE':
+    case 'DEFAULT':
+    default:
+      return { bg: 'bg-slate-100 text-slate-700 border-slate-200', label: 'Level 1: Umum' };
+  }
+};
 
 interface PricingAndProfitHubProps {
   dbState: DatabaseState;
@@ -58,6 +86,8 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
   const [calcTargetMargin, setCalcTargetMargin] = useState<number>(0.15); // 15%
   const [calcCustomHpp, setCalcCustomHpp] = useState<number>(0);
   const [useCustomHpp, setUseCustomHpp] = useState<boolean>(false);
+  const [calcIncludeOptionalPrograms, setCalcIncludeOptionalPrograms] = useState<boolean>(true);
+  const [calcAdsTargetRate, setCalcAdsTargetRate] = useState<number>(0.05); // 5% Target Ads Budget
 
   // Active SKU object
   const activeSkuObj = useMemo(() => {
@@ -66,40 +96,66 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
 
   const effectiveHpp = useCustomHpp ? calcCustomHpp : activeSkuObj?.hpp || 25000;
 
-  // Real calculation for calculator
+  // Real dynamic calculation for calculator using Cost Rule Engine
   const calcResult = useMemo(() => {
-    // Estimasi biaya platform ~8.5%
-    const estFeeRate = 0.085;
-    const estAdsRate = 0.05; // 5% ads target
+    const activePrograms = calcIncludeOptionalPrograms
+      ? ['ALL_MANDATORY', 'FREE_SHIPPING', 'CASHBACK', 'ALL']
+      : ['ALL_MANDATORY'];
 
-    // Target Selling Price formula: Price = HPP / (1 - FeeRate - AdsRate - TargetMargin)
-    const divisor = 1 - estFeeRate - estAdsRate - calcTargetMargin;
-    const recommendedPrice = divisor > 0 ? Math.round(effectiveHpp / divisor / 500) * 500 : effectiveHpp * 1.5;
+    const lookupContextBase = {
+      marketplaceId: calcMarketplace,
+      categoryId: activeSkuObj?.category_id || '',
+      brandId: activeSkuObj?.brand_id || '',
+      spuId: activeSkuObj?.spu_id || '',
+      sku: calcSku,
+      unitId: calcUnit,
+      activePrograms,
+    };
 
-    // Platform Fee Breakdown using real rules
-    const feeResult = getApplicableMarketplaceFees(
-      recommendedPrice,
-      calcMarketplace,
-      activeSkuObj?.category_id || '',
-      activeSkuObj?.brand_id || '',
-      activeSkuObj?.spu_id || '',
-      calcSku,
-      calcUnit,
+    // Iteratively resolve price with dynamic cost rules (handles caps, fixed fees, percentages)
+    let currentPrice = Math.max(1000, effectiveHpp * 1.35);
+
+    for (let i = 0; i < 4; i++) {
+      const tempFee = calculateDynamicCostRules(
+        { ...lookupContextBase, sellingPrice: currentPrice },
+        dbState.costRules
+      );
+      const dynamicFeeRate = currentPrice > 0 ? tempFee.totalFeeAmount / currentPrice : 0;
+      const divisor = 1 - dynamicFeeRate - calcAdsTargetRate - calcTargetMargin;
+      if (divisor > 0.05) {
+        currentPrice = effectiveHpp / divisor;
+      } else {
+        currentPrice = effectiveHpp * 1.5;
+        break;
+      }
+    }
+
+    const recommendedPrice = Math.max(effectiveHpp, Math.round(currentPrice / 500) * 500);
+
+    // Final accurate dynamic fee evaluation at recommended price
+    const feeResult = calculateDynamicCostRules(
+      { ...lookupContextBase, sellingPrice: recommendedPrice },
       dbState.costRules
     );
 
     const totalFeeAmount = feeResult.totalFeeAmount;
+    const effectiveFeeRate = feeResult.effectiveFeeRate;
     const grossProfit = recommendedPrice - effectiveHpp;
     const profitBeforeAds = grossProfit - totalFeeAmount;
-    const adsBudget = Math.round(recommendedPrice * estAdsRate);
+    const adsBudget = Math.round(recommendedPrice * calcAdsTargetRate);
     const netProfit = profitBeforeAds - adsBudget;
     const netMargin = recommendedPrice > 0 ? netProfit / recommendedPrice : 0;
     const beRoas = profitBeforeAds > 0 ? recommendedPrice / profitBeforeAds : 0;
 
     return {
       recommendedPrice,
-      fees: feeResult.fees,
+      feeResult,
       totalFeeAmount,
+      effectiveFeeRate,
+      hasConfiguredFees: feeResult.hasConfiguredFees,
+      warning: feeResult.warning,
+      breakdown: feeResult.breakdown,
+      appliedTiers: feeResult.appliedTiers,
       grossProfit,
       profitBeforeAds,
       adsBudget,
@@ -107,98 +163,17 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
       netMargin,
       beRoas,
     };
-  }, [effectiveHpp, calcTargetMargin, calcMarketplace, activeSkuObj, calcSku, calcUnit, dbState.costRules]);
-
-  // --- TAB 2: BIAYA MARKETPLACE (COST RULES) STATE ---
-  const [selectedFeeMkt, setSelectedFeeMkt] = useState<string>('ALL');
-  const [isFeeModalOpen, setIsFeeModalOpen] = useState(false);
-  const [editingFee, setEditingFee] = useState<CostRuleRecord | null>(null);
-
-  // Fee Form
-  const [formMktId, setFormMktId] = useState('MKT-SHOPEE');
-  const [formCostName, setFormCostName] = useState('Biaya Admin');
-  const [formCostGroup, setFormCostGroup] = useState('PLATFORM_FEE');
-  const [formCalcType, setFormCalcType] = useState<CalculationType>('PERCENTAGE_MAX');
-  const [formRate, setFormRate] = useState(0.065);
-  const [formFixedAmount, setFormFixedAmount] = useState(0);
-  const [formMaxFee, setFormMaxFee] = useState(10000);
-  const [formMinFee, setFormMinFee] = useState(0);
-
-  const openAddFee = () => {
-    setEditingFee(null);
-    setFormMktId('MKT-SHOPEE');
-    setFormCostName('Biaya Layanan');
-    setFormCostGroup('PLATFORM_FEE');
-    setFormCalcType('PERCENTAGE');
-    setFormRate(0.04);
-    setFormFixedAmount(0);
-    setFormMaxFee(0);
-    setFormMinFee(0);
-    setIsFeeModalOpen(true);
-  };
-
-  const openEditFee = (rule: CostRuleRecord) => {
-    setEditingFee(rule);
-    setFormMktId(rule.marketplace_id);
-    setFormCostName(rule.cost_name);
-    setFormCostGroup(rule.cost_group);
-    setFormCalcType(rule.calculation_type);
-    setFormRate(rule.rate);
-    setFormFixedAmount(rule.fixed_amount);
-    setFormMaxFee(rule.maximum_fee || 0);
-    setFormMinFee(rule.minimum_fee || 0);
-    setIsFeeModalOpen(true);
-  };
-
-  const handleSaveFee = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (editingFee) {
-      storageService.updateCostRule(editingFee.rule_id, {
-        marketplace_id: formMktId,
-        cost_name: formCostName,
-        cost_group: formCostGroup,
-        calculation_type: formCalcType,
-        rate: formRate,
-        fixed_amount: formFixedAmount,
-        maximum_fee: formMaxFee > 0 ? formMaxFee : null,
-        minimum_fee: formMinFee > 0 ? formMinFee : null,
-      });
-    } else {
-      storageService.addCostRule({
-        marketplace_id: formMktId,
-        cost_name: formCostName,
-        cost_group: formCostGroup,
-        mandatory: true,
-        calculation_type: formCalcType,
-        calculation_base: 'SELLING_PRICE',
-        rate: formRate,
-        fixed_amount: formFixedAmount,
-        maximum_fee: formMaxFee > 0 ? formMaxFee : null,
-        minimum_fee: formMinFee > 0 ? formMinFee : null,
-        program: null,
-        effective_from: '2026-01-01',
-        priority: 50,
-        active: true,
-        updated_by: 'Admin',
-      });
-    }
-    setIsFeeModalOpen(false);
-  };
-
-  const handleDeleteFee = (rule: CostRuleRecord) => {
-    if (confirm(`Hapus aturan biaya "${rule.cost_name}"?`)) {
-      storageService.deleteCostRule(rule.rule_id);
-    }
-  };
-
-  const filteredCostRules = useMemo(() => {
-    return dbState.costRules.filter((r) => {
-      if (selectedFeeMkt !== 'ALL' && r.marketplace_id !== selectedFeeMkt) {
-        return false;
-      }
-      return true;
-    });
-  }, [dbState.costRules, selectedFeeMkt]);
+  }, [
+    effectiveHpp,
+    calcTargetMargin,
+    calcAdsTargetRate,
+    calcMarketplace,
+    activeSkuObj,
+    calcSku,
+    calcUnit,
+    calcIncludeOptionalPrograms,
+    dbState.costRules,
+  ]);
 
   // --- TAB 3: SIMULASI IKLAN STATE ---
   const [simSellingPrice, setSimSellingPrice] = useState<number>(75000);
@@ -322,12 +297,13 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
                   <select
                     value={calcMarketplace}
                     onChange={(e) => setCalcMarketplace(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white"
+                    className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white font-medium text-slate-800"
                   >
-                    <option value="MKT-SHOPEE">Shopee</option>
-                    <option value="MKT-TOKOPEDIA">Tokopedia</option>
-                    <option value="MKT-TIKTOK">TikTok Shop</option>
-                    <option value="MKT-LAZADA">Lazada</option>
+                    {dbState.marketplaces.map((m) => (
+                      <option key={m.marketplace_id} value={m.marketplace_id}>
+                        {m.marketplace_name}
+                      </option>
+                    ))}
                   </select>
                 </div>
                 <div>
@@ -335,10 +311,13 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
                   <select
                     value={calcUnit}
                     onChange={(e) => setCalcUnit(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white"
+                    className="w-full px-3 py-2 rounded-lg border border-slate-200 bg-white font-medium text-slate-800"
                   >
-                    <option value="U001">Kanbai</option>
-                    <option value="U002">Nutribite</option>
+                    {dbState.units.map((u) => (
+                      <option key={u.unit_id} value={u.unit_id}>
+                        {u.unit_name}
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
@@ -355,13 +334,54 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
                   step="0.01"
                   value={calcTargetMargin}
                   onChange={(e) => setCalcTargetMargin(Number(e.target.value))}
-                  className="w-full accent-blue-600"
+                  className="w-full accent-blue-600 cursor-pointer"
                 />
                 <div className="flex justify-between text-[10px] text-slate-400 mt-0.5">
                   <span>5% (Tipis)</span>
                   <span>15% (Sehat)</span>
                   <span>40% (Tinggi)</span>
                 </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="font-medium text-slate-700">Target Budget Iklan</label>
+                  <span className="font-bold text-slate-800">{formatPercent(calcAdsTargetRate)}</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.01"
+                  max="0.15"
+                  step="0.005"
+                  value={calcAdsTargetRate}
+                  onChange={(e) => setCalcAdsTargetRate(Number(e.target.value))}
+                  className="w-full accent-indigo-600 cursor-pointer"
+                />
+                <div className="flex justify-between text-[10px] text-slate-400 mt-0.5">
+                  <span>1%</span>
+                  <span>5% (Standar)</span>
+                  <span>15% (Agresif)</span>
+                </div>
+              </div>
+
+              {/* Toggle Optional Programs */}
+              <div className="pt-2 border-t border-slate-100">
+                <label className="flex items-start space-x-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={calcIncludeOptionalPrograms}
+                    onChange={(e) => setCalcIncludeOptionalPrograms(e.target.checked)}
+                    className="mt-0.5 rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
+                  />
+                  <div>
+                    <span className="font-semibold text-slate-800 block text-[11px]">
+                      Sertakan Program Opsional Marketplace
+                    </span>
+                    <span className="text-[10px] text-slate-500 block leading-tight">
+                      Hitung Gratis Ongkir XTRA, Cashback, & biaya program ke dalam harga rekomendasi.
+                    </span>
+                  </div>
+                </label>
               </div>
 
               <div className="pt-2 border-t border-slate-100">
@@ -391,17 +411,28 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
 
           {/* Center & Right: Calculation Results */}
           <div className="lg:col-span-2 bg-white rounded-2xl border border-slate-200 p-5 shadow-2xs space-y-5">
-            <div>
-              <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                Hasil Rekomendasi Harga
-              </span>
-              <div className="flex items-baseline space-x-3 mt-1">
-                <div className="text-2xl sm:text-3xl font-extrabold text-blue-600">
-                  {formatIDR(calcResult.recommendedPrice)}
+            <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-slate-100 pb-3">
+              <div>
+                <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                  Hasil Rekomendasi Harga Retail Ideal
+                </span>
+                <div className="flex items-baseline space-x-3 mt-1">
+                  <div className="text-2xl sm:text-3xl font-extrabold text-blue-600">
+                    {formatIDR(calcResult.recommendedPrice)}
+                  </div>
+                  <div className="text-xs font-medium text-slate-500">
+                    Margin Bersih Target: {formatPercent(calcResult.netMargin)}
+                  </div>
                 </div>
-                <div className="text-xs font-medium text-slate-500">
-                  Perkiraan harga jual retail ideal
-                </div>
+              </div>
+
+              <div className="text-right">
+                <span className="text-[11px] font-semibold text-slate-400 block uppercase">
+                  Biaya Efektif Marketplace
+                </span>
+                <span className="text-base font-bold text-amber-700 font-mono">
+                  {formatPercent(calcResult.effectiveFeeRate)} ({formatIDR(calcResult.totalFeeAmount)})
+                </span>
               </div>
             </div>
 
@@ -409,165 +440,178 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
                 <span className="text-slate-400 block text-[11px]">Biaya Modal (HPP)</span>
-                <span className="font-bold text-slate-900 mt-1 block">{formatIDR(effectiveHpp)}</span>
-              </div>
-              <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
-                <span className="text-slate-400 block text-[11px]">Potongan Marketplace</span>
-                <span className="font-bold text-slate-900 mt-1 block">
-                  {formatIDR(calcResult.totalFeeAmount)}
+                <span className="font-bold text-slate-900 mt-1 block font-mono">{formatIDR(effectiveHpp)}</span>
+                <span className="text-[10px] text-slate-400 block mt-0.5">
+                  {calcResult.recommendedPrice > 0
+                    ? formatPercent(effectiveHpp / calcResult.recommendedPrice)
+                    : '-'} dari harga
                 </span>
               </div>
-              <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
-                <span className="text-slate-400 block text-[11px]">Batas Budget Iklan</span>
-                <span className="font-bold text-slate-900 mt-1 block">{formatIDR(calcResult.adsBudget)}</span>
+              <div className="p-3 rounded-xl bg-amber-50/60 border border-amber-200/80">
+                <span className="text-amber-700 block text-[11px] font-medium">Potongan Marketplace</span>
+                <span className="font-bold text-amber-900 mt-1 block font-mono">
+                  {formatIDR(calcResult.totalFeeAmount)}
+                </span>
+                <span className="text-[10px] text-amber-600 block mt-0.5">
+                  Tarif Efektif {formatPercent(calcResult.effectiveFeeRate)}
+                </span>
+              </div>
+              <div className="p-3 rounded-xl bg-indigo-50/60 border border-indigo-200/80">
+                <span className="text-indigo-700 block text-[11px] font-medium">Batas Budget Iklan</span>
+                <span className="font-bold text-indigo-900 mt-1 block font-mono">{formatIDR(calcResult.adsBudget)}</span>
+                <span className="text-[10px] text-indigo-600 block mt-0.5">
+                  Target ROAS ~{(1 / (calcAdsTargetRate || 0.05)).toFixed(1)}x
+                </span>
               </div>
               <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-100">
                 <span className="text-emerald-700 block text-[11px] font-medium">Laba Bersih Estimasi</span>
-                <span className="font-bold text-emerald-800 mt-1 block">{formatIDR(calcResult.netProfit)}</span>
+                <span className="font-bold text-emerald-800 mt-1 block font-mono">{formatIDR(calcResult.netProfit)}</span>
+                <span className="text-[10px] text-emerald-600 block mt-0.5">
+                  Margin {formatPercent(calcResult.netMargin)}
+                </span>
               </div>
             </div>
 
-            {/* Detail Biaya Marketplace */}
-            <div className="border border-slate-100 rounded-xl p-4 bg-slate-50/50 space-y-2">
-              <div className="text-xs font-bold text-slate-900 mb-2">
-                Rincian Potongan Biaya Marketplace Terkait
+            {/* Rincian Lengkap Potongan Biaya Marketplace (Dinamis dari Cost Rule Engine) */}
+            <div className="border border-slate-200/90 rounded-2xl p-4 bg-slate-50/50 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200/60 pb-2.5">
+                <div className="flex items-center space-x-2">
+                  <span className="text-xs font-bold text-slate-900">
+                    Rincian Potongan Biaya Marketplace (Aturan Dinamis)
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-50 text-blue-700 border border-blue-100">
+                    {calcResult.feeResult.fees.length} Komponen Aktif
+                  </span>
+                </div>
+                <div className="text-xs text-slate-500">
+                  Target: <strong className="text-slate-800">{activeSkuObj?.sku}</strong> (Kategori: {dbState.categories.find(c => c.category_id === activeSkuObj?.category_id)?.category_name || activeSkuObj?.category_id})
+                </div>
               </div>
-              {calcResult.fees.length > 0 ? (
-                calcResult.fees.map((fee, idx) => (
-                  <div key={idx} className="flex justify-between text-xs text-slate-600 py-1 border-b border-slate-100 last:border-0">
-                    <span>{fee.costName}</span>
-                    <span className="font-semibold text-slate-900">{formatIDR(fee.feeAmount)}</span>
+
+              {/* Warning if no rules configured */}
+              {!calcResult.hasConfiguredFees && (
+                <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs space-y-1.5">
+                  <div className="flex items-center space-x-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span className="font-bold">Biaya Belum Diatur untuk Marketplace Ini!</span>
                   </div>
-                ))
-              ) : (
-                <div className="flex justify-between text-xs text-slate-600 py-1">
-                  <span>Biaya Layanan Standar (~8.5%)</span>
-                  <span className="font-semibold text-slate-900">{formatIDR(calcResult.totalFeeAmount)}</span>
+                  <p className="text-slate-600">
+                    {calcResult.warning || 'Belum ada aturan biaya yang terdaftar untuk kombinasi marketplace, kategori, dan produk ini. Sistem tidak mengasumsikan 0% secara otomatis.'}
+                  </p>
+                  <button
+                    onClick={() => handleTabSwitch('fees')}
+                    className="inline-flex items-center space-x-1.5 font-semibold text-blue-600 hover:text-blue-700 mt-1"
+                  >
+                    <span>Buka Menu Biaya Marketplace untuk menambah aturan</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {/* Quick Summary Pill by Canonical Types */}
+              {calcResult.hasConfiguredFees && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                  <div className="p-2.5 rounded-xl bg-white border border-slate-200/80 shadow-2xs">
+                    <span className="text-[10px] text-slate-400 block font-medium">Biaya Admin</span>
+                    <span className="font-bold text-slate-900 font-mono mt-0.5 block">
+                      {formatIDR(calcResult.breakdown.adminFee)}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-white border border-slate-200/80 shadow-2xs">
+                    <span className="text-[10px] text-slate-400 block font-medium">Biaya Layanan</span>
+                    <span className="font-bold text-slate-900 font-mono mt-0.5 block">
+                      {formatIDR(calcResult.breakdown.serviceFee)}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-white border border-slate-200/80 shadow-2xs">
+                    <span className="text-[10px] text-slate-400 block font-medium">Biaya Transaksi / Pembayaran</span>
+                    <span className="font-bold text-slate-900 font-mono mt-0.5 block">
+                      {formatIDR(calcResult.breakdown.paymentFee)}
+                    </span>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-white border border-slate-200/80 shadow-2xs">
+                    <span className="text-[10px] text-slate-400 block font-medium">Gratis Ongkir Xtra</span>
+                    <span className="font-bold text-slate-900 font-mono mt-0.5 block">
+                      {formatIDR(calcResult.breakdown.freeShippingFee)}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* Granular Rule-by-Rule Itemized List */}
+              {calcResult.feeResult.fees.length > 0 && (
+                <div className="overflow-x-auto bg-white rounded-xl border border-slate-200/80 shadow-2xs">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 text-slate-600 font-semibold border-b border-slate-200">
+                      <tr>
+                        <th className="py-2.5 px-3">Tingkat Prioritas</th>
+                        <th className="py-2.5 px-3">Komponen Biaya</th>
+                        <th className="py-2.5 px-3">Ketentuan / Formula</th>
+                        <th className="py-2.5 px-3 text-right">Potongan (Rp)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {calcResult.feeResult.fees.map((fee, idx) => {
+                        const badge = getTierBadge(fee.priorityTier);
+                        return (
+                          <tr key={idx} className="hover:bg-slate-50/60 transition-colors">
+                            <td className="py-2.5 px-3">
+                              <span
+                                className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold border ${badge.bg}`}
+                              >
+                                {badge.label}
+                              </span>
+                              <span className="ml-1 text-[10px] font-mono text-slate-400">
+                                (P:{fee.specificityScore})
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <div className="font-semibold text-slate-900">{fee.costName}</div>
+                              {fee.program && (
+                                <div className="text-[10px] text-blue-600 font-medium">
+                                  Program: {fee.program}
+                                </div>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-600 font-mono">
+                              {fee.rate > 0 ? formatPercent(fee.rate) : ''}
+                              {fee.rate > 0 && fee.fixedAmount > 0 ? ' + ' : ''}
+                              {fee.fixedAmount > 0 ? formatIDR(fee.fixedAmount) : ''}
+                              {fee.matchedRule?.maximum_fee
+                                ? ` (Maks. ${formatIDR(fee.matchedRule.maximum_fee)})`
+                                : ''}
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-bold text-amber-900 font-mono">
+                              {formatIDR(fee.feeAmount)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
               )}
             </div>
 
             {/* Safety Indicators */}
-            <div className="p-3.5 rounded-xl border border-blue-100 bg-blue-50/40 flex items-center justify-between text-xs">
+            <div className="p-3.5 rounded-xl border border-blue-100 bg-blue-50/40 flex flex-wrap items-center justify-between gap-2 text-xs">
               <div className="flex items-center space-x-2">
-                <CheckCircle2 className="w-4 h-4 text-blue-600" />
+                <CheckCircle2 className="w-4 h-4 text-blue-600 shrink-0" />
                 <span className="text-blue-900 font-medium">
                   Break-Even ROAS: <span className="font-bold">{calcResult.beRoas.toFixed(2)}x</span>
                 </span>
               </div>
               <span className="text-blue-700 text-[11px]">
-                Iklan tetap untung selama ROAS di atas {calcResult.beRoas.toFixed(2)}x
+                Iklan tetap menghasilkan keuntungan selama efisiensi ROAS di atas {calcResult.beRoas.toFixed(2)}x
               </span>
             </div>
           </div>
         </div>
       )}
 
-      {/* --- SUBTAB 2: BIAYA MARKETPLACE (COST RULES) --- */}
+      {/* --- SUBTAB 2: BIAYA MARKETPLACE (COST RULE HIERARCHY) --- */}
       {currentSubTab === 'fees' && (
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-4 rounded-xl border border-slate-200">
-            <div className="flex items-center space-x-2">
-              <span className="text-xs font-semibold text-slate-700">Filter Marketplace:</span>
-              <select
-                value={selectedFeeMkt}
-                onChange={(e) => setSelectedFeeMkt(e.target.value)}
-                className="px-2.5 py-1 rounded-lg border border-slate-200 text-xs bg-white text-slate-800"
-              >
-                <option value="ALL">Semua Marketplace</option>
-                <option value="MKT-SHOPEE">Shopee</option>
-                <option value="MKT-TOKOPEDIA">Tokopedia</option>
-                <option value="MKT-TIKTOK">TikTok Shop</option>
-                <option value="MKT-LAZADA">Lazada</option>
-              </select>
-            </div>
-
-            <button
-              onClick={openAddFee}
-              className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 shadow-xs"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Tambah Aturan Biaya</span>
-            </button>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xs overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 font-semibold border-b border-slate-200">
-                  <tr>
-                    <th className="py-3 px-4">Nama Potongan Biaya</th>
-                    <th className="py-3 px-4">Marketplace</th>
-                    <th className="py-3 px-4">Kategori Biaya</th>
-                    <th className="py-3 px-4">Tarif Persentase</th>
-                    <th className="py-3 px-4">Batas Maksimal</th>
-                    <th className="py-3 px-4">Status</th>
-                    <th className="py-3 px-4 text-right">Aksi</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {filteredCostRules.map((rule) => {
-                    const mktName = dbState.marketplaces.find((m) => m.marketplace_id === rule.marketplace_id)?.marketplace_name || rule.marketplace_id;
-                    const groupLabel =
-                      rule.cost_group === 'PLATFORM_FEE'
-                        ? 'Biaya Admin'
-                        : rule.cost_group === 'SHIPPING_FEE'
-                        ? 'Gratis Ongkir'
-                        : rule.cost_group === 'CAMPAIGN'
-                        ? 'Promo Campaign'
-                        : 'Lainnya';
-
-                    return (
-                      <tr key={rule.rule_id} className="hover:bg-slate-50/60 transition-colors">
-                        <td className="py-3 px-4">
-                          <div className="font-semibold text-slate-900">{rule.cost_name}</div>
-                          {rule.program && (
-                            <div className="text-[10px] text-slate-400 mt-0.5">Program: {rule.program}</div>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 font-medium text-slate-800">{mktName}</td>
-                        <td className="py-3 px-4 text-slate-600">{groupLabel}</td>
-                        <td className="py-3 px-4 font-bold text-slate-900">
-                          {formatPercent(rule.rate)}
-                        </td>
-                        <td className="py-3 px-4 text-slate-700">
-                          {rule.maximum_fee ? formatIDR(rule.maximum_fee) : '-'}
-                        </td>
-                        <td className="py-3 px-4">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                              rule.active
-                                ? 'bg-emerald-50 text-emerald-700'
-                                : 'bg-slate-100 text-slate-500'
-                            }`}
-                          >
-                            {rule.active ? 'Aktif' : 'Non-aktif'}
-                          </span>
-                        </td>
-                        <td className="py-3 px-4 text-right space-x-2">
-                          <button
-                            onClick={() => openEditFee(rule)}
-                            className="p-1 text-slate-500 hover:text-blue-600 transition-colors"
-                            title="Edit Aturan"
-                          >
-                            <Edit2 className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => handleDeleteFee(rule)}
-                            className="p-1 text-slate-400 hover:text-red-600 transition-colors"
-                            title="Hapus Aturan"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+        <CostRuleHierarchySection dbState={dbState} />
       )}
 
       {/* --- SUBTAB 3: SIMULASI IKLAN --- */}
@@ -706,111 +750,6 @@ export const PricingAndProfitHub: React.FC<PricingAndProfitHubProps> = ({
                 Tingkatkan harga jual atau sesuaikan HPP untuk memberi ruang margin iklan yang lebih aman.
               </p>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal: Tambah/Edit Aturan Biaya */}
-      {isFeeModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-base font-bold text-slate-900">
-                {editingFee ? 'Edit Aturan Biaya' : 'Tambah Aturan Biaya Marketplace'}
-              </h3>
-              <button onClick={() => setIsFeeModalOpen(false)} className="text-slate-400 hover:text-slate-600">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <form onSubmit={handleSaveFee} className="space-y-3 text-xs">
-              <div>
-                <label className="block font-medium text-slate-700 mb-1">Nama Potongan</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="Contoh: Biaya Admin Gratis Ongkir"
-                  value={formCostName}
-                  onChange={(e) => setFormCostName(e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-medium text-slate-700 mb-1">Marketplace</label>
-                  <select
-                    value={formMktId}
-                    onChange={(e) => setFormMktId(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs bg-white"
-                  >
-                    <option value="MKT-SHOPEE">Shopee</option>
-                    <option value="MKT-TOKOPEDIA">Tokopedia</option>
-                    <option value="MKT-TIKTOK">TikTok Shop</option>
-                    <option value="MKT-LAZADA">Lazada</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block font-medium text-slate-700 mb-1">Kategori Biaya</label>
-                  <select
-                    value={formCostGroup}
-                    onChange={(e) => setFormCostGroup(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs bg-white"
-                  >
-                    <option value="PLATFORM_FEE">Biaya Admin</option>
-                    <option value="SHIPPING_FEE">Gratis Ongkir</option>
-                    <option value="CAMPAIGN">Promo Campaign</option>
-                    <option value="OTHER">Lainnya</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-medium text-slate-700 mb-1">Tarif Persentase (0 - 1)</label>
-                  <input
-                    type="number"
-                    step="0.001"
-                    min="0"
-                    max="1"
-                    required
-                    value={formRate}
-                    onChange={(e) => setFormRate(Number(e.target.value))}
-                    className="w-full px-3 py-2 rounded-lg border border-slate-200 font-bold text-xs"
-                  />
-                  <span className="text-[10px] text-slate-400 block mt-0.5">
-                    {formatPercent(formRate)}
-                  </span>
-                </div>
-                <div>
-                  <label className="block font-medium text-slate-700 mb-1">Batas Maksimal Potongan</label>
-                  <input
-                    type="number"
-                    step="500"
-                    min="0"
-                    value={formMaxFee}
-                    onChange={(e) => setFormMaxFee(Number(e.target.value))}
-                    className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs"
-                  />
-                </div>
-              </div>
-
-              <div className="pt-3 flex items-center justify-end space-x-2">
-                <button
-                  type="button"
-                  onClick={() => setIsFeeModalOpen(false)}
-                  className="px-4 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
-                >
-                  Batal
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold"
-                >
-                  Simpan Aturan
-                </button>
-              </div>
-            </form>
           </div>
         </div>
       )}
